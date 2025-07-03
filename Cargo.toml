@@ -1,0 +1,53 @@
+[package]
+name = "rwshell"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Command line parsing
+clap = { version = "4", features = ["derive"] }
+
+# Base64 encoding/decoding
+base64 = "0.22"
+
+# Terminal utilities
+terminal_size = "0.4"
+termios = "0.3"
+
+# Embedded assets
+rust-embed = "8"
+mime_guess = "2"
+
+# Terminal detection
+atty = "0.2"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# PTY functionality
+portable-pty = "0.9"
+
+# WebSocket
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
