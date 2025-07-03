@@ -1,10 +1,11 @@
-use crate::error::{Result, RwShellError};
+use crate::error::Result;
 use crate::pty::PtyHandler;
 use crate::websocket::{TtyMessage, TtyWebSocket};
 use axum::extract::ws::WebSocket;
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -33,7 +34,7 @@ pub struct TtyShareSession {
 impl TtyShareSession {
     pub fn new(pty: Arc<Mutex<dyn PtyHandler>>) -> Self {
         let (output_tx, _) = broadcast::channel(1024);
-        
+
         Self {
             id: Uuid::new_v4().to_string(),
             pty,
@@ -46,16 +47,18 @@ impl TtyShareSession {
     }
 
     pub async fn add_connection(&self, socket: WebSocket) -> Result<()> {
-        let mut tty_ws = TtyWebSocket::new(socket);
-        
+        let tty_ws = Arc::new(Mutex::new(TtyWebSocket::new(socket)));
+
         // Clone the PTY handler for this connection
         let pty = Arc::clone(&self.pty);
-        
+
         // Set up output broadcasting
         let mut output_rx = self.output_tx.subscribe();
+        let tty_ws_output = Arc::clone(&tty_ws);
         let output_task = tokio::spawn(async move {
             while let Ok(message) = output_rx.recv().await {
-                if let Err(e) = tty_ws.send(message).await {
+                let mut ws = tty_ws_output.lock().await;
+                if let Err(e) = ws.send(message).await {
                     error!("Failed to send message to WebSocket: {}", e);
                     break;
                 }
@@ -64,12 +67,13 @@ impl TtyShareSession {
 
         // Set up input handling
         let session_output_tx = self.output_tx.clone();
+        let tty_ws_input = Arc::clone(&tty_ws);
         let input_task = tokio::spawn(async move {
-            Self::handle_connection_messages(tty_ws, pty, session_output_tx).await
+            Self::handle_connection_messages(tty_ws_input, pty, session_output_tx).await
         });
 
         info!("New WebSocket connection added to session {}", self.id);
-        
+
         // Wait for either task to complete
         tokio::select! {
             _ = output_task => {},
@@ -80,19 +84,29 @@ impl TtyShareSession {
     }
 
     async fn handle_connection_messages(
-        mut tty_ws: TtyWebSocket,
+        tty_ws: Arc<Mutex<TtyWebSocket>>,
         pty: Arc<Mutex<dyn PtyHandler>>,
         _output_tx: broadcast::Sender<TtyMessage>,
     ) -> Result<()> {
-        while let Some(message) = tty_ws.recv().await {
+        loop {
+            let message = {
+                let mut ws = tty_ws.lock().await;
+                ws.recv().await
+            };
+
             match message {
-                Ok(msg) => {
+                Some(Ok(msg)) => {
                     debug!("Received message: {:?}", msg);
                     match msg.msg_type.as_str() {
                         "Write" => {
-                            if let Ok(write_msg_data) = base64::decode(&msg.data) {
-                                if let Ok(write_msg) = serde_json::from_slice::<WriteMessage>(&write_msg_data) {
-                                    if let Ok(decoded_data) = base64::decode(&write_msg.data) {
+                            if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&msg.data)
+                            {
+                                if let Ok(write_msg) =
+                                    serde_json::from_slice::<WriteMessage>(&write_msg_data)
+                                {
+                                    if let Ok(decoded_data) =
+                                        general_purpose::STANDARD.decode(&write_msg.data)
+                                    {
                                         let mut pty_guard = pty.lock().await;
                                         if let Err(e) = pty_guard.write(&decoded_data).await {
                                             error!("Failed to write to PTY: {}", e);
@@ -106,8 +120,12 @@ impl TtyShareSession {
                         }
                     }
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     error!("Error receiving WebSocket message: {}", e);
+                    break;
+                }
+                None => {
+                    debug!("WebSocket connection closed");
                     break;
                 }
             }
@@ -118,12 +136,12 @@ impl TtyShareSession {
     pub async fn broadcast_output(&self, data: &[u8]) -> Result<()> {
         let write_msg = WriteMessage {
             size: data.len(),
-            data: base64::encode(data),
+            data: general_purpose::STANDARD.encode(data),
         };
-        
+
         let message = TtyMessage {
             msg_type: "Write".to_string(),
-            data: base64::encode(serde_json::to_vec(&write_msg)?),
+            data: general_purpose::STANDARD.encode(serde_json::to_vec(&write_msg)?),
         };
 
         if let Err(e) = self.output_tx.send(message) {
@@ -135,10 +153,10 @@ impl TtyShareSession {
 
     pub async fn broadcast_window_size(&self, cols: u16, rows: u16) -> Result<()> {
         let win_size_msg = WinSizeMessage { cols, rows };
-        
+
         let message = TtyMessage {
             msg_type: "WinSize".to_string(),
-            data: base64::encode(serde_json::to_vec(&win_size_msg)?),
+            data: general_purpose::STANDARD.encode(serde_json::to_vec(&win_size_msg)?),
         };
 
         if let Err(e) = self.output_tx.send(message) {

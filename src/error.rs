@@ -6,7 +6,7 @@ pub enum RwShellError {
     Io(#[from] std::io::Error),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -31,3 +31,9 @@ pub enum RwShellError {
 }
 
 pub type Result<T> = std::result::Result<T, RwShellError>;
+
+impl From<tokio_tungstenite::tungstenite::Error> for RwShellError {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        RwShellError::WebSocket(Box::new(err))
+    }
+}
