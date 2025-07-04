@@ -2,6 +2,8 @@
 name = "rwshell"
 version = "1.0.0"
 edition = "2021"
+description = "A Rust-based WebSocket shell server and client"
+default-run = "rwshell"
 
 [[bin]]
 name = "rwshell"
