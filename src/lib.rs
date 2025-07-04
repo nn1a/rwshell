@@ -1,6 +1,5 @@
 pub mod args;
 pub mod assets;
-pub mod client;
 pub mod error;
 pub mod pty;
 pub mod server;

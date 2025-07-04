@@ -745,7 +745,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             debug!("Ignoring input in read-only mode");
                             continue;
                         }
-                        
+
                         if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&tty_msg.data)
                         {
                             if let Ok(write_msg) =
