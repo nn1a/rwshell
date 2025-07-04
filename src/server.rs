@@ -103,7 +103,7 @@ impl RwShellServer {
             }
         }
 
-        let _child = pty_pair.slave.spawn_command(cmd)?;
+        let mut child = pty_pair.slave.spawn_command(cmd)?;
         let master = pty_pair.master;
 
         // Get writer for PTY input
@@ -147,7 +147,37 @@ impl RwShellServer {
         // Create a shutdown signal for when PTY process ends
         let cancellation_token = CancellationToken::new();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (child_shutdown_tx, child_shutdown_rx) = tokio::sync::oneshot::channel();
         let mut shutdown_tx = Some(shutdown_tx);
+
+        // Monitor child process to prevent zombie processes
+        let token_child = cancellation_token.clone();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(exit_status)) => {
+                        debug!("Child process exited with status: {:?}", exit_status);
+                        let _ = child_shutdown_tx.send(());
+                        token_child.cancel();
+                        break;
+                    }
+                    Ok(None) => {
+                        // Process is still running, check cancellation and continue
+                        if token_child.is_cancelled() {
+                            debug!("Child monitor task cancelled");
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        error!("Error checking child process status: {}", e);
+                        let _ = child_shutdown_tx.send(());
+                        token_child.cancel();
+                        break;
+                    }
+                }
+            }
+        });
 
         let token_clone = cancellation_token.clone();
         let termios_clone = original_termios;
@@ -311,6 +341,15 @@ impl RwShellServer {
                             std::process::exit(0);
                         });
                     }
+                    _ = child_shutdown_rx => {
+                        debug!("Child process ended, shutting down server");
+                        token_shutdown.cancel();
+                        tokio::spawn(async {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            debug!("Exiting rwshell");
+                            std::process::exit(0);
+                        });
+                    }
                     _ = tokio::signal::ctrl_c() => {
                         debug!("Received Ctrl+C in headless mode, shutting down server");
                         token_shutdown.cancel();
@@ -318,10 +357,15 @@ impl RwShellServer {
                     }
                 }
             } else {
-                // In interactive mode, only listen for shell process termination
-                // Ctrl+C and other signals should go to the shell, not rwshell
-                shutdown_rx.await.ok();
-                debug!("Shell process ended, shutting down server");
+                // In interactive mode, listen for shell or child process termination
+                tokio::select! {
+                    _ = shutdown_rx => {
+                        debug!("Shell process ended, shutting down server");
+                    }
+                    _ = child_shutdown_rx => {
+                        debug!("Child process ended, shutting down server");
+                    }
+                }
                 token_shutdown.cancel();
 
                 // Restore terminal before exiting
