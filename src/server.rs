@@ -30,6 +30,7 @@ pub struct AppState {
     pub pty_writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pub current_size: Arc<Mutex<(u16, u16)>>, // (cols, rows)
     pub output_buffer: Arc<Mutex<Vec<u8>>>,   // Buffer for output before client connects
+    pub readonly: bool,                       // Whether session is read-only
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +55,12 @@ struct WinSizeMessage {
     cols: u16,
     #[serde(rename = "Rows")]
     rows: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReadOnlyMessage {
+    #[serde(rename = "ReadOnly")]
+    readonly: bool,
 }
 
 pub struct RwShellServer {
@@ -124,6 +131,7 @@ impl RwShellServer {
             pty_writer: Arc::new(Mutex::new(Some(pty_writer))),
             current_size: Arc::new(Mutex::new((cols, rows))),
             output_buffer: Arc::new(Mutex::new(Vec::new())),
+            readonly: self.args.readonly,
         };
 
         let app = self.create_app(app_state.clone()).await?;
@@ -432,9 +440,33 @@ impl RwShellServer {
             .route(&session_path, get(serve_session_page))
             .route(&static_path, get(serve_static_file))
             .route(&ws_path, get(handle_websocket))
+            .fallback(serve_404)
             .with_state(state);
 
         Ok(app)
+    }
+}
+
+async fn serve_404() -> Response {
+    match Assets::get_file("404.html") {
+        Some(content) => {
+            let content_str = String::from_utf8_lossy(&content.data);
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                content_str.to_string(),
+            )
+                .into_response()
+        }
+        None => {
+            // Fallback if 404.html is not found
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "404 - Page Not Found".to_string(),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -447,13 +479,35 @@ fn get_terminal_size() -> (u16, u16) {
     }
 }
 
-async fn serve_static_file(Path(file): Path<String>) -> Result<Response, StatusCode> {
+async fn serve_static_file(Path(file): Path<String>) -> Response {
     match Assets::get_file(&file) {
         Some(content) => {
             let mime_type = Assets::get_content_type(&file);
-            Ok(([(header::CONTENT_TYPE, mime_type)], content.data).into_response())
+            ([(header::CONTENT_TYPE, mime_type)], content.data).into_response()
         }
-        None => Err(StatusCode::NOT_FOUND),
+        None => {
+            // Serve 404.html with 404 status code for missing static files
+            match Assets::get_file("404.html") {
+                Some(content) => {
+                    let content_str = String::from_utf8_lossy(&content.data);
+                    (
+                        StatusCode::NOT_FOUND,
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        content_str.to_string(),
+                    )
+                        .into_response()
+                }
+                None => {
+                    // Fallback if 404.html is not found
+                    (
+                        StatusCode::NOT_FOUND,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        "404 - Static File Not Found".to_string(),
+                    )
+                        .into_response()
+                }
+            }
+        }
     }
 }
 
@@ -532,6 +586,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             "Sent initial terminal size: {}x{}",
             current_size.0, current_size.1
         );
+    }
+
+    // Send readonly state to new client
+    {
+        let readonly_msg = ReadOnlyMessage {
+            readonly: state.readonly,
+        };
+
+        let message = TtyMessage {
+            msg_type: "ReadOnly".to_string(),
+            data: general_purpose::STANDARD.encode(serde_json::to_vec(&readonly_msg).unwrap()),
+        };
+
+        let json_str = serde_json::to_string(&message).unwrap();
+
+        if let Err(e) = sender
+            .send(axum::extract::ws::Message::Text(json_str.into()))
+            .await
+        {
+            let error_msg = e.to_string();
+            if error_msg.contains("closed connection")
+                || error_msg.contains("Connection reset")
+                || error_msg.contains("Trying to work with closed connection")
+            {
+                debug!(
+                    "WebSocket connection closed while sending readonly state: {}",
+                    e
+                );
+            } else {
+                error!("Failed to send readonly state: {}", e);
+            }
+            return;
+        }
+
+        debug!("Sent readonly state: {}", state.readonly);
     }
 
     // Send buffered output to new client
@@ -627,7 +716,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 .send(axum::extract::ws::Message::Text(json_str.into()))
                 .await
             {
-                // 연결이 닫힌 경우는 정상적인 상황이므로 debug 레벨로 로깅
                 let error_msg = e.to_string();
                 if error_msg.contains("closed connection")
                     || error_msg.contains("Connection reset")
@@ -645,12 +733,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Handle WebSocket input
     let pty_writer = state.pty_writer;
+    let readonly = state.readonly;
     let receiver_task = tokio::spawn(async move {
         while let Some(msg) = receiver.next().await {
             if let Ok(axum::extract::ws::Message::Text(text)) = msg {
                 debug!("Received WebSocket message: {} chars", text.len());
                 if let Ok(tty_msg) = serde_json::from_str::<TtyMessage>(&text) {
                     if tty_msg.msg_type == "Write" {
+                        // Ignore input if session is read-only
+                        if readonly {
+                            debug!("Ignoring input in read-only mode");
+                            continue;
+                        }
+                        
                         if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&tty_msg.data)
                         {
                             if let Ok(write_msg) =

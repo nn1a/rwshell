@@ -4,15 +4,15 @@ use clap::Parser;
 #[command(name = "rwshell")]
 #[command(about = "Share your terminal over the web")]
 pub struct Args {
-    /// [s] The command to run
+    /// The command to run
     #[arg(long, default_value_t = get_default_shell())]
     pub command: String,
 
-    /// [s] The command arguments
+    /// The command arguments
     #[arg(long, default_value = "")]
     pub args: String,
 
-    /// [s] rwshell server address
+    /// rwshell server address
     #[arg(long, default_value = "localhost:8000")]
     pub listen: String,
 
@@ -20,19 +20,19 @@ pub struct Args {
     #[arg(long)]
     pub version: bool,
 
-    /// [s] Start a read only session
+    /// Start a read only session
     #[arg(long)]
     pub readonly: bool,
 
-    /// [s] Don't expect an interactive terminal at stdin
+    /// Don't expect an interactive terminal at stdin
     #[arg(long)]
     pub headless: bool,
 
-    /// [s] Number of cols for the allocated pty when running headless
+    /// Number of cols for the allocated pty when running headless
     #[arg(long, default_value = "80")]
     pub headless_cols: u16,
 
-    /// [s] Number of rows for the allocated pty when running headless
+    /// Number of rows for the allocated pty when running headless
     #[arg(long, default_value = "25")]
     pub headless_rows: u16,
 
