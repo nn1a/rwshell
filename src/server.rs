@@ -29,7 +29,7 @@ pub struct AppState {
     pub pty_tx: broadcast::Sender<Vec<u8>>,
     pub pty_writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pub current_size: Arc<Mutex<(u16, u16)>>, // (cols, rows)
-    pub output_buffer: Arc<Mutex<Vec<u8>>>, // Buffer for output before client connects
+    pub output_buffer: Arc<Mutex<Vec<u8>>>,   // Buffer for output before client connects
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +103,10 @@ impl RwShellServer {
                 cmd.arg(arg);
             }
         }
+
+        // set RWSHELL environment variable to indicate we're in rwshell
+        cmd.env("RWSHELL", "1");
+        cmd.env("RWSHELL_SESSION", &self.session_id);
 
         let mut child = pty_pair.slave.spawn_command(cmd)?;
         let master = pty_pair.master;
@@ -196,7 +200,7 @@ impl RwShellServer {
 
                         // Check if there are any subscribers
                         let has_subscribers = pty_tx_clone.receiver_count() > 0;
-                        
+
                         if has_subscribers {
                             // Send to WebSocket clients
                             match pty_tx_clone.send(data.clone()) {
@@ -211,7 +215,7 @@ impl RwShellServer {
                             // No subscribers, buffer the data (up to 1KB)
                             let mut output_buffer = app_state_buffer.output_buffer.blocking_lock();
                             output_buffer.extend_from_slice(&data);
-                            
+
                             // Keep only the last 1KB of data
                             const MAX_BUFFER_SIZE: usize = 1024;
                             if output_buffer.len() > MAX_BUFFER_SIZE {
@@ -219,7 +223,7 @@ impl RwShellServer {
                                 output_buffer.drain(0..start);
                             }
                         }
-                        
+
                         // Write to stdout if not headless
                         if !headless {
                             print!("{}", String::from_utf8_lossy(&data));
@@ -455,7 +459,7 @@ async fn serve_static_file(Path(file): Path<String>) -> Result<Response, StatusC
 
 async fn serve_session_page(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     debug!("Serving session page for session: {}", state.session_id);
-    match Assets::get_file("rwshell.html") {
+    match Assets::get_file("index.html") {
         Some(template) => {
             let template_str = String::from_utf8_lossy(&template.data);
             let (path_prefix, ws_path) = if state.session_id == "local" {
@@ -469,8 +473,8 @@ async fn serve_session_page(State(state): State<AppState>) -> Result<Html<String
 
             // Simple template replacement
             let rendered = template_str
-                .replace("{{.PathPrefix}}", &path_prefix)
-                .replace("{{.WSPath}}", &format!("\"{ws_path}\""));
+                .replace("__PathPrefix__", &path_prefix)
+                .replace("__WSPath__", &format!("\"{ws_path}\""));
 
             Ok(Html(rendered))
         }
@@ -509,7 +513,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             .send(axum::extract::ws::Message::Text(json_str.into()))
             .await
         {
-            error!("Failed to send initial terminal size: {}", e);
+            let error_msg = e.to_string();
+            if error_msg.contains("closed connection")
+                || error_msg.contains("Connection reset")
+                || error_msg.contains("Trying to work with closed connection")
+            {
+                debug!(
+                    "WebSocket connection closed while sending initial terminal size: {}",
+                    e
+                );
+            } else {
+                error!("Failed to send initial terminal size: {}", e);
+            }
             return;
         }
 
@@ -523,8 +538,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     {
         let mut output_buffer = state.output_buffer.lock().await;
         if !output_buffer.is_empty() {
-            debug!("Sending {} bytes of buffered output to new client", output_buffer.len());
-            
+            debug!(
+                "Sending {} bytes of buffered output to new client",
+                output_buffer.len()
+            );
+
             let write_msg = WriteMessage {
                 size: output_buffer.len(),
                 data: general_purpose::STANDARD.encode(&*output_buffer),
@@ -541,10 +559,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 .send(axum::extract::ws::Message::Text(json_str.into()))
                 .await
             {
-                error!("Failed to send buffered output: {}", e);
+                // 연결이 닫힌 경우는 정상적인 상황이므로 debug 레벨로 로깅
+                let error_msg = e.to_string();
+                if error_msg.contains("closed connection")
+                    || error_msg.contains("Connection reset")
+                    || error_msg.contains("Trying to work with closed connection")
+                {
+                    debug!(
+                        "WebSocket connection closed while sending buffered output: {}",
+                        e
+                    );
+                } else {
+                    error!("Failed to send buffered output: {}", e);
+                }
                 return;
             }
-            
+
             // Clear the buffer after sending
             output_buffer.clear();
         }
@@ -564,7 +594,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         ))
                         .await
                     {
-                        error!("Failed to send WinSize message: {}", e);
+                        let error_msg = e.to_string();
+                        if error_msg.contains("closed connection")
+                            || error_msg.contains("Connection reset")
+                            || error_msg.contains("Trying to work with closed connection")
+                        {
+                            debug!("WebSocket connection closed while sending WinSize: {}", e);
+                        } else {
+                            error!("Failed to send WinSize message: {}", e);
+                        }
                         break;
                     }
                     continue;
@@ -589,7 +627,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 .send(axum::extract::ws::Message::Text(json_str.into()))
                 .await
             {
-                error!("Failed to send WebSocket message: {}", e);
+                // 연결이 닫힌 경우는 정상적인 상황이므로 debug 레벨로 로깅
+                let error_msg = e.to_string();
+                if error_msg.contains("closed connection")
+                    || error_msg.contains("Connection reset")
+                    || error_msg.contains("Trying to work with closed connection")
+                {
+                    debug!("WebSocket connection closed: {}", e);
+                } else {
+                    error!("Failed to send WebSocket message: {}", e);
+                }
                 break;
             }
         }

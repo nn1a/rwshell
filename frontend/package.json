@@ -1,7 +1,0 @@
-{
-  "dependencies": {
-    "@xterm/addon-canvas": "^0.7.0",
-    "@xterm/addon-clipboard": "^0.1.0",
-    "@xterm/addon-webgl": "^0.18.0"
-  }
-}
