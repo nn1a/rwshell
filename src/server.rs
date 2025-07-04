@@ -29,6 +29,7 @@ pub struct AppState {
     pub pty_tx: broadcast::Sender<Vec<u8>>,
     pub pty_writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pub current_size: Arc<Mutex<(u16, u16)>>, // (cols, rows)
+    pub output_buffer: Arc<Mutex<Vec<u8>>>, // Buffer for output before client connects
 }
 
 #[derive(Serialize, Deserialize)]
@@ -118,6 +119,7 @@ impl RwShellServer {
             pty_tx: pty_tx.clone(),
             pty_writer: Arc::new(Mutex::new(Some(pty_writer))),
             current_size: Arc::new(Mutex::new((cols, rows))),
+            output_buffer: Arc::new(Mutex::new(Vec::new())),
         };
 
         let app = self.create_app(app_state.clone()).await?;
@@ -181,6 +183,7 @@ impl RwShellServer {
 
         let token_clone = cancellation_token.clone();
         let termios_clone = original_termios;
+        let app_state_buffer = app_state.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
             let mut reader = master_reader;
@@ -191,15 +194,32 @@ impl RwShellServer {
                     Ok(n) if n > 0 => {
                         let data = buffer[..n].to_vec();
 
-                        // Send to WebSocket clients (ignore error if no subscribers)
-                        match pty_tx_clone.send(data.clone()) {
-                            Ok(_) => {
-                                // Successfully sent to subscribers
+                        // Check if there are any subscribers
+                        let has_subscribers = pty_tx_clone.receiver_count() > 0;
+                        
+                        if has_subscribers {
+                            // Send to WebSocket clients
+                            match pty_tx_clone.send(data.clone()) {
+                                Ok(_) => {
+                                    // Successfully sent to subscribers
+                                }
+                                Err(tokio::sync::broadcast::error::SendError(_)) => {
+                                    // No subscribers, which shouldn't happen here but handle gracefully
+                                }
                             }
-                            Err(tokio::sync::broadcast::error::SendError(_)) => {
-                                // No subscribers, which is fine - continue reading
+                        } else {
+                            // No subscribers, buffer the data (up to 1KB)
+                            let mut output_buffer = app_state_buffer.output_buffer.blocking_lock();
+                            output_buffer.extend_from_slice(&data);
+                            
+                            // Keep only the last 1KB of data
+                            const MAX_BUFFER_SIZE: usize = 1024;
+                            if output_buffer.len() > MAX_BUFFER_SIZE {
+                                let start = output_buffer.len() - MAX_BUFFER_SIZE;
+                                output_buffer.drain(0..start);
                             }
                         }
+                        
                         // Write to stdout if not headless
                         if !headless {
                             print!("{}", String::from_utf8_lossy(&data));
@@ -497,6 +517,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             "Sent initial terminal size: {}x{}",
             current_size.0, current_size.1
         );
+    }
+
+    // Send buffered output to new client
+    {
+        let mut output_buffer = state.output_buffer.lock().await;
+        if !output_buffer.is_empty() {
+            debug!("Sending {} bytes of buffered output to new client", output_buffer.len());
+            
+            let write_msg = WriteMessage {
+                size: output_buffer.len(),
+                data: general_purpose::STANDARD.encode(&*output_buffer),
+            };
+
+            let message = TtyMessage {
+                msg_type: "Write".to_string(),
+                data: general_purpose::STANDARD.encode(serde_json::to_vec(&write_msg).unwrap()),
+            };
+
+            let json_str = serde_json::to_string(&message).unwrap();
+
+            if let Err(e) = sender
+                .send(axum::extract::ws::Message::Text(json_str.into()))
+                .await
+            {
+                error!("Failed to send buffered output: {}", e);
+                return;
+            }
+            
+            // Clear the buffer after sending
+            output_buffer.clear();
+        }
     }
 
     // Forward PTY output to WebSocket
