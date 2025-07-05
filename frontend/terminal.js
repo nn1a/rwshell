@@ -113,6 +113,9 @@ class TTYReceiver {
 
     // Initialize readonly state
     this.readonly = false;
+    
+    // Initialize headless state
+    this.headless = false;
 
     // Create and load addons for enhanced functionality (with fallbacks)
     this.fitAddon = null;
@@ -246,6 +249,13 @@ class TTYReceiver {
           this.readonly = readOnlyMsg.ReadOnly;
           this.updateReadOnlyState();
         }
+
+        if (message.Type === "Headless") {
+          const headlessMsg = JSON.parse(msgData);
+          console.debug("Received Headless state:", headlessMsg.Headless);
+          this.headless = headlessMsg.Headless;
+          this.updateHeadlessState();
+        }
       } catch (e) {
         console.error("Error processing message:", e);
       }
@@ -284,7 +294,13 @@ class TTYReceiver {
     window.addEventListener("resize", () => {
       clearTimeout(resizeTimeout);
       resizeTimeout = setTimeout(() => {
-        this.fitTerminalToScreen();
+        // Only handle resize if in headless mode
+        if (this.headless) {
+          console.debug("Window resized in headless mode, fitting terminal");
+          this.fitTerminalToScreen();
+        } else {
+          console.debug("Window resized but not in headless mode, ignoring");
+        }
       }, 150);
     });
   }
@@ -310,29 +326,48 @@ class TTYReceiver {
     this.updateStatusBar();
   }
 
+  updateHeadlessState() {
+    console.debug(`Server headless state updated: ${this.headless}`);
+    if (this.headless) {
+      console.debug("Server is in headless mode - web client will control terminal size");
+      // In headless mode, fit terminal to browser window
+      this.fitTerminalToScreen();
+    } else {
+      console.debug("Server is not in headless mode - server controls terminal size");
+      // In non-headless mode, wait for server size updates
+    }
+    this.updateStatusBar();
+  }
+
   fitTerminalToScreen() {
     if (!this.terminal || !this.containerElement) return;
 
-    if (this.serverCols > 0 && this.serverRows > 0) {
+    // In non-headless mode, server controls the size
+    if (!this.headless && this.serverCols > 0 && this.serverRows > 0) {
       console.debug(
-        `Fitting terminal to server size: ${this.serverCols}x${this.serverRows}`
+        `Server is not in headless mode, fitting to server size: ${this.serverCols}x${this.serverRows}`
       );
       this.fitToServerSize(this.serverCols, this.serverRows);
       return;
     }
 
-    if (this.fitAddon) {
+    // In headless mode, use fitAddon to fit to browser window
+    if (this.headless && this.fitAddon) {
       try {
         this.fitAddon.fit();
         console.debug(
-          `Terminal fitted to screen: ${this.terminal.cols}x${this.terminal.rows}`
+          `Terminal fitted to screen in headless mode: ${this.terminal.cols}x${this.terminal.rows}`
         );
         this.updateStatusBar();
+        this.sendTerminalResize();
         return;
       } catch (e) {
         console.error("Error fitting terminal to screen:", e);
       }
     }
+
+    // Fallback for cases where fitAddon is not available
+    console.debug("No fitAddon available or not in headless mode, using fallback sizing");
   }
 
   fitToServerSize(cols, rows) {
@@ -493,6 +528,9 @@ class TTYReceiver {
       if (this.readonly) {
         statusText += " (Read-Only)";
       }
+      if (this.headless) {
+        statusText += " (Headless)";
+      }
       statusElement.textContent = statusText;
     }
   }
@@ -535,6 +573,29 @@ class TTYReceiver {
 
     // Enable selection for copy operations
     this.terminal.options.selectionManager = true;
+  }
+
+  sendTerminalResize() {
+    // Only send resize messages to server if in headless mode
+    if (!this.headless || !this.connection || this.connection.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    try {
+      const winSizeMessage = {
+        Type: "WinSize",
+        Data: base64Encode(
+          JSON.stringify({
+            Cols: this.terminal.cols,
+            Rows: this.terminal.rows,
+          })
+        ),
+      };
+      console.debug(`Sending terminal resize to server: ${this.terminal.cols}x${this.terminal.rows}`);
+      this.connection.send(JSON.stringify(winSizeMessage));
+    } catch (e) {
+      console.error("Error sending terminal resize:", e);
+    }
   }
 }
 

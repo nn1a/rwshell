@@ -52,9 +52,7 @@ impl TtyWebSocket {
         self.socket
             .send(Message::Text(json_str.into()))
             .await
-            .map_err(|e| {
-                RwShellError::Server(format!("Failed to send WebSocket message: {e:?}"))
-            })?;
+            .map_err(|e| RwShellError::Server(format!("Failed to send WebSocket message: {e:?}")))?;
         Ok(())
     }
 }

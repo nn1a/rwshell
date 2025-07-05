@@ -1,24 +1,24 @@
 use crate::args::Args;
 use crate::assets::Assets;
 use axum::{
+    Router,
     extract::{
-        ws::{WebSocket, WebSocketUpgrade},
         Path, State,
+        ws::{WebSocket, WebSocketUpgrade},
     },
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Router,
 };
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use terminal_size::{terminal_size, Height, Width};
-use termios::{tcsetattr, Termios, TCSANOW};
+use terminal_size::{Height, Width, terminal_size};
+use termios::{TCSANOW, Termios, tcsetattr};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -28,9 +28,13 @@ pub struct AppState {
     pub session_id: String,
     pub pty_tx: broadcast::Sender<Vec<u8>>,
     pub pty_writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
-    pub current_size: Arc<Mutex<(u16, u16)>>, // (cols, rows)
-    pub output_buffer: Arc<Mutex<Vec<u8>>>,   // Buffer for output before client connects
-    pub readonly: bool,                       // Whether session is read-only
+    pub pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>, // Add PTY master for resizing
+    pub current_size: Arc<Mutex<(u16, u16)>>,              // (cols, rows)
+    pub output_buffer: Arc<Mutex<Vec<u8>>>,                // Buffer for output before client connects
+    pub readonly: bool,                                    // Whether session is read-only
+    pub headless: bool,                                    // Whether server is in headless mode
+    pub last_resize_time: Arc<Mutex<std::time::Instant>>,  // For rate limiting resize requests
+    pub pending_resize: Arc<Mutex<Option<(u16, u16)>>>,    // Store pending resize request
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +65,171 @@ struct WinSizeMessage {
 struct ReadOnlyMessage {
     #[serde(rename = "ReadOnly")]
     readonly: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HeadlessMessage {
+    #[serde(rename = "Headless")]
+    headless: bool,
+}
+
+/// Validates terminal size to prevent abuse or invalid values
+fn is_valid_terminal_size(cols: u16, rows: u16) -> bool {
+    // Minimum reasonable terminal size
+    const MIN_COLS: u16 = 10;
+    const MIN_ROWS: u16 = 5;
+
+    // Maximum reasonable terminal size (prevent memory/resource abuse)
+    const MAX_COLS: u16 = 1000;
+    const MAX_ROWS: u16 = 1000;
+
+    // Check for zero values (invalid)
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+
+    // Check bounds
+    (MIN_COLS..=MAX_COLS).contains(&cols) && (MIN_ROWS..=MAX_ROWS).contains(&rows)
+}
+
+/// Process resize request with rate limiting and pending request handling
+async fn process_resize_request(
+    cols: u16,
+    rows: u16,
+    last_resize_time: &Arc<Mutex<std::time::Instant>>,
+    pending_resize: &Arc<Mutex<Option<(u16, u16)>>>,
+    pty_master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    current_size: &Arc<Mutex<(u16, u16)>>,
+    pty_tx: &broadcast::Sender<Vec<u8>>,
+) -> bool {
+    const MIN_RESIZE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let now = std::time::Instant::now();
+    let should_apply_immediately = {
+        let mut last_time = last_resize_time.lock().await;
+        if now.duration_since(*last_time) >= MIN_RESIZE_INTERVAL {
+            *last_time = now;
+            true
+        } else {
+            false
+        }
+    };
+
+    if should_apply_immediately {
+        // Apply the resize immediately
+        apply_resize(cols, rows, pty_master, current_size, pty_tx).await;
+        true
+    } else {
+        // Store as pending resize (overwrites any previous pending)
+        {
+            let mut pending_lock = pending_resize.lock().await;
+            *pending_lock = Some((cols, rows));
+        }
+        debug!(
+            "Rate limiting: storing resize request as pending: {}x{} ({}ms since last)",
+            cols,
+            rows,
+            now.duration_since(*last_resize_time.lock().await).as_millis()
+        );
+        false
+    }
+}
+
+/// Apply resize immediately without rate limiting
+async fn apply_resize(
+    cols: u16,
+    rows: u16,
+    pty_master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    current_size: &Arc<Mutex<(u16, u16)>>,
+    pty_tx: &broadcast::Sender<Vec<u8>>,
+) {
+    // Update stored size
+    {
+        let mut stored_size = current_size.lock().await;
+        *stored_size = (cols, rows);
+    }
+
+    // Resize the PTY
+    {
+        let pty_master_lock = pty_master.lock().await;
+        let new_size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        if let Err(e) = pty_master_lock.resize(new_size) {
+            error!("Failed to resize PTY: {}", e);
+        } else {
+            debug!("Successfully resized PTY to {}x{}", cols, rows);
+        }
+    }
+
+    // Broadcast size change to other WebSocket clients
+    let winsize_msg = WinSizeMessage { cols, rows };
+    let tty_msg_broadcast = TtyMessage {
+        msg_type: "WinSize".to_string(),
+        data: general_purpose::STANDARD.encode(serde_json::to_vec(&winsize_msg).unwrap()),
+    };
+
+    let json_str = serde_json::to_string(&tty_msg_broadcast).unwrap();
+    let _ = pty_tx.send(format!("WINSIZE:{json_str}").into_bytes());
+}
+
+/// Start a background task to process pending resize requests
+fn start_pending_resize_processor(
+    last_resize_time: Arc<Mutex<std::time::Instant>>,
+    pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
+    pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    current_size: Arc<Mutex<(u16, u16)>>,
+    pty_tx: broadcast::Sender<Vec<u8>>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        const MIN_RESIZE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    debug!("Pending resize processor cancelled");
+                    break;
+                }
+                _ = interval.tick() => {
+                    // Check if we have a pending resize and enough time has passed
+                    let pending = {
+                        let pending_lock = pending_resize.lock().await;
+                        *pending_lock
+                    };
+
+                    if let Some((cols, rows)) = pending {
+                        let now = std::time::Instant::now();
+                        let last_time = *last_resize_time.lock().await;
+
+                        if now.duration_since(last_time) >= MIN_RESIZE_INTERVAL {
+                            // Clear the pending resize
+                            {
+                                let mut pending_lock = pending_resize.lock().await;
+                                *pending_lock = None;
+                            }
+
+                            // Update last resize time
+                            {
+                                let mut last_time_lock = last_resize_time.lock().await;
+                                *last_time_lock = now;
+                            }
+
+                            debug!("Processing pending resize: {}x{}", cols, rows);
+                            apply_resize(cols, rows, &pty_master, &current_size, &pty_tx).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 pub struct RwShellServer {
@@ -96,6 +265,19 @@ impl RwShellServer {
             get_terminal_size()
         };
 
+        // Validate initial terminal size
+        if !is_valid_terminal_size(cols, rows) {
+            return Err(anyhow::anyhow!(
+                "Invalid initial terminal size: {}x{} (must be between {}x{} and {}x{})",
+                cols,
+                rows,
+                10,
+                5,
+                1000,
+                1000
+            ));
+        }
+
         let pty_pair = pty_system.openpty(PtySize {
             rows,
             cols,
@@ -121,6 +303,9 @@ impl RwShellServer {
         // Get writer for PTY input
         let pty_writer = master.take_writer()?;
 
+        // Clone master for reading before moving it to AppState
+        let master_reader = master.try_clone_reader()?;
+
         // Create broadcast channel for PTY output
         let (pty_tx, _) = broadcast::channel(1024);
 
@@ -129,9 +314,13 @@ impl RwShellServer {
             session_id: self.session_id.clone(),
             pty_tx: pty_tx.clone(),
             pty_writer: Arc::new(Mutex::new(Some(pty_writer))),
+            pty_master: Arc::new(Mutex::new(master)),
             current_size: Arc::new(Mutex::new((cols, rows))),
             output_buffer: Arc::new(Mutex::new(Vec::new())),
             readonly: self.args.readonly,
+            headless: self.args.headless,
+            last_resize_time: Arc::new(Mutex::new(std::time::Instant::now())),
+            pending_resize: Arc::new(Mutex::new(None)),
         };
 
         let app = self.create_app(app_state.clone()).await?;
@@ -154,7 +343,6 @@ impl RwShellServer {
         debug!("Server listening on: {}", self.args.listen);
 
         // Start PTY output forwarding in background
-        let master_reader = master.try_clone_reader()?;
         let pty_tx_clone = pty_tx.clone();
         let headless = self.args.headless;
 
@@ -163,6 +351,18 @@ impl RwShellServer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (child_shutdown_tx, child_shutdown_rx) = tokio::sync::oneshot::channel();
         let mut shutdown_tx = Some(shutdown_tx);
+
+        // Start pending resize processor for headless mode
+        if self.args.headless {
+            start_pending_resize_processor(
+                app_state.last_resize_time.clone(),
+                app_state.pending_resize.clone(),
+                app_state.pty_master.clone(),
+                app_state.current_size.clone(),
+                pty_tx.clone(),
+                cancellation_token.clone(),
+            );
+        }
 
         // Monitor child process to prevent zombie processes
         let token_child = cancellation_token.clone();
@@ -295,10 +495,34 @@ impl RwShellServer {
                                 debug!("Terminal size changed: {}x{} -> {}x{}",
                                        last_size.0, last_size.1, current_size.0, current_size.1);
 
+                                // Validate the new terminal size before applying it
+                                if !is_valid_terminal_size(current_size.0, current_size.1) {
+                                    debug!("Ignoring invalid terminal size from host terminal: {}x{}",
+                                           current_size.0, current_size.1);
+                                    continue;
+                                }
+
                                 // Update stored size
                                 {
                                     let mut stored_size = app_state_resize.current_size.lock().await;
                                     *stored_size = current_size;
+                                }
+
+                                // Resize the PTY to match new terminal size
+                                {
+                                    let pty_master = app_state_resize.pty_master.lock().await;
+                                    let new_size = PtySize {
+                                        rows: current_size.1,
+                                        cols: current_size.0,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                    };
+
+                                    if let Err(e) = pty_master.resize(new_size) {
+                                        error!("Failed to resize PTY: {}", e);
+                                    } else {
+                                        debug!("Successfully resized PTY to {}x{}", current_size.0, current_size.1);
+                                    }
                                 }
 
                                 // Send size change to all WebSocket clients
@@ -330,7 +554,7 @@ impl RwShellServer {
         if !self.args.headless {
             let pty_writer_stdin = Arc::clone(&app_state.pty_writer);
             tokio::task::spawn_blocking(move || {
-                use std::io::{stdin, Read, Write};
+                use std::io::{Read, Write, stdin};
                 let mut stdin = stdin();
                 let mut buffer = [0u8; 1024];
 
@@ -563,29 +787,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         let json_str = serde_json::to_string(&message).unwrap();
 
-        if let Err(e) = sender
-            .send(axum::extract::ws::Message::Text(json_str.into()))
-            .await
-        {
+        if let Err(e) = sender.send(axum::extract::ws::Message::Text(json_str.into())).await {
             let error_msg = e.to_string();
             if error_msg.contains("closed connection")
                 || error_msg.contains("Connection reset")
                 || error_msg.contains("Trying to work with closed connection")
             {
-                debug!(
-                    "WebSocket connection closed while sending initial terminal size: {}",
-                    e
-                );
+                debug!("WebSocket connection closed while sending initial terminal size: {}", e);
             } else {
                 error!("Failed to send initial terminal size: {}", e);
             }
             return;
         }
 
-        debug!(
-            "Sent initial terminal size: {}x{}",
-            current_size.0, current_size.1
-        );
+        debug!("Sent initial terminal size: {}x{}", current_size.0, current_size.1);
     }
 
     // Send readonly state to new client
@@ -601,19 +816,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         let json_str = serde_json::to_string(&message).unwrap();
 
-        if let Err(e) = sender
-            .send(axum::extract::ws::Message::Text(json_str.into()))
-            .await
-        {
+        if let Err(e) = sender.send(axum::extract::ws::Message::Text(json_str.into())).await {
             let error_msg = e.to_string();
             if error_msg.contains("closed connection")
                 || error_msg.contains("Connection reset")
                 || error_msg.contains("Trying to work with closed connection")
             {
-                debug!(
-                    "WebSocket connection closed while sending readonly state: {}",
-                    e
-                );
+                debug!("WebSocket connection closed while sending readonly state: {}", e);
             } else {
                 error!("Failed to send readonly state: {}", e);
             }
@@ -623,14 +832,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         debug!("Sent readonly state: {}", state.readonly);
     }
 
+    // Send headless state to new client
+    {
+        let headless_msg = HeadlessMessage {
+            headless: state.headless,
+        };
+
+        let message = TtyMessage {
+            msg_type: "Headless".to_string(),
+            data: general_purpose::STANDARD.encode(serde_json::to_vec(&headless_msg).unwrap()),
+        };
+
+        let json_str = serde_json::to_string(&message).unwrap();
+
+        if let Err(e) = sender.send(axum::extract::ws::Message::Text(json_str.into())).await {
+            let error_msg = e.to_string();
+            if error_msg.contains("closed connection")
+                || error_msg.contains("Connection reset")
+                || error_msg.contains("Trying to work with closed connection")
+            {
+                debug!("WebSocket connection closed while sending headless state: {}", e);
+            } else {
+                error!("Failed to send headless state: {}", e);
+            }
+            return;
+        }
+
+        debug!("Sent headless state: {}", state.headless);
+    }
+
     // Send buffered output to new client
     {
         let mut output_buffer = state.output_buffer.lock().await;
         if !output_buffer.is_empty() {
-            debug!(
-                "Sending {} bytes of buffered output to new client",
-                output_buffer.len()
-            );
+            debug!("Sending {} bytes of buffered output to new client", output_buffer.len());
 
             let write_msg = WriteMessage {
                 size: output_buffer.len(),
@@ -644,20 +879,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
             let json_str = serde_json::to_string(&message).unwrap();
 
-            if let Err(e) = sender
-                .send(axum::extract::ws::Message::Text(json_str.into()))
-                .await
-            {
+            if let Err(e) = sender.send(axum::extract::ws::Message::Text(json_str.into())).await {
                 // 연결이 닫힌 경우는 정상적인 상황이므로 debug 레벨로 로깅
                 let error_msg = e.to_string();
                 if error_msg.contains("closed connection")
                     || error_msg.contains("Connection reset")
                     || error_msg.contains("Trying to work with closed connection")
                 {
-                    debug!(
-                        "WebSocket connection closed while sending buffered output: {}",
-                        e
-                    );
+                    debug!("WebSocket connection closed while sending buffered output: {}", e);
                 } else {
                     error!("Failed to send buffered output: {}", e);
                 }
@@ -678,9 +907,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // Extract and send the WinSize message directly
                     // Remove "WINSIZE:" prefix
                     if let Err(e) = sender
-                        .send(axum::extract::ws::Message::Text(
-                            winsize_json.to_string().into(),
-                        ))
+                        .send(axum::extract::ws::Message::Text(winsize_json.to_string().into()))
                         .await
                     {
                         let error_msg = e.to_string();
@@ -712,10 +939,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
             let json_str = serde_json::to_string(&message).unwrap();
 
-            if let Err(e) = sender
-                .send(axum::extract::ws::Message::Text(json_str.into()))
-                .await
-            {
+            if let Err(e) = sender.send(axum::extract::ws::Message::Text(json_str.into())).await {
                 let error_msg = e.to_string();
                 if error_msg.contains("closed connection")
                     || error_msg.contains("Connection reset")
@@ -734,6 +958,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Handle WebSocket input
     let pty_writer = state.pty_writer;
     let readonly = state.readonly;
+    let headless = state.headless;
+    let pty_master_for_resize = state.pty_master;
+    let current_size_for_resize = state.current_size;
+    let pty_tx_for_resize = state.pty_tx;
+    let last_resize_time = state.last_resize_time;
+    let pending_resize = state.pending_resize;
     let receiver_task = tokio::spawn(async move {
         while let Some(msg) = receiver.next().await {
             if let Ok(axum::extract::ws::Message::Text(text)) = msg {
@@ -746,14 +976,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
-                        if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&tty_msg.data)
-                        {
-                            if let Ok(write_msg) =
-                                serde_json::from_slice::<WriteMessage>(&write_msg_data)
-                            {
-                                if let Ok(decoded_data) =
-                                    general_purpose::STANDARD.decode(&write_msg.data)
-                                {
+                        if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&tty_msg.data) {
+                            if let Ok(write_msg) = serde_json::from_slice::<WriteMessage>(&write_msg_data) {
+                                if let Ok(decoded_data) = general_purpose::STANDARD.decode(&write_msg.data) {
                                     debug!(
                                         "Writing {} bytes to PTY: {:?}",
                                         decoded_data.len(),
@@ -764,6 +989,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         let _ = writer.write_all(&decoded_data);
                                         let _ = writer.flush();
                                     }
+                                }
+                            }
+                        }
+                    } else if tty_msg.msg_type == "WinSize" && headless {
+                        // Only process WinSize messages from clients in headless mode
+                        if let Ok(winsize_data) = general_purpose::STANDARD.decode(&tty_msg.data) {
+                            if let Ok(winsize_msg) = serde_json::from_slice::<WinSizeMessage>(&winsize_data) {
+                                // Validate terminal size to prevent abuse
+                                if !is_valid_terminal_size(winsize_msg.cols, winsize_msg.rows) {
+                                    debug!(
+                                        "Rejected invalid terminal size from client: {}x{} (outside valid range)",
+                                        winsize_msg.cols, winsize_msg.rows
+                                    );
+                                    continue;
+                                }
+
+                                debug!(
+                                    "Received WinSize from client in headless mode: {}x{}",
+                                    winsize_msg.cols, winsize_msg.rows
+                                );
+
+                                // Process the resize request with rate limiting
+                                let applied = process_resize_request(
+                                    winsize_msg.cols,
+                                    winsize_msg.rows,
+                                    &last_resize_time,
+                                    &pending_resize,
+                                    &pty_master_for_resize,
+                                    &current_size_for_resize,
+                                    &pty_tx_for_resize,
+                                )
+                                .await;
+
+                                if applied {
+                                    debug!("Resize applied immediately: {}x{}", winsize_msg.cols, winsize_msg.rows);
+                                } else {
+                                    debug!("Resize stored as pending: {}x{}", winsize_msg.cols, winsize_msg.rows);
                                 }
                             }
                         }

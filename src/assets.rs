@@ -10,8 +10,6 @@ impl Assets {
     }
 
     pub fn get_content_type(path: &str) -> String {
-        mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string()
+        mime_guess::from_path(path).first_or_octet_stream().to_string()
     }
 }

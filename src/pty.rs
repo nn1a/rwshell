@@ -1,6 +1,6 @@
 use crate::error::{Result, RwShellError};
 use async_trait::async_trait;
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::broadcast;
 use tracing::info;
 

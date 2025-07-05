@@ -1,19 +1,26 @@
 use anyhow::Result;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
-use termios::{tcsetattr, Termios};
+use std::sync::atomic::AtomicBool;
+use termios::{Termios, tcsetattr};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error};
 use url::Url;
 
-// Global state for terminal restoration
+// Global state for terminal restoration and window size monitoring
 static mut ORIGINAL_TERMIOS: Option<Termios> = None;
 static TERMIOS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static TERMIOS_MUTEX: Mutex<()> = Mutex::new(());
+static WINDOW_SIZE_CHANGED: AtomicBool = AtomicBool::new(false);
+
+// SIGWINCH signal handler for window size changes
+extern "C" fn sigwinch_handler(_: i32) {
+    WINDOW_SIZE_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 // Global terminal restoration function
 extern "C" fn global_restore_terminal() {
@@ -84,6 +91,20 @@ struct WriteMessage {
     size: usize,
     #[serde(rename = "Data")]
     data: String, // base64 encoded
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WinSizeMessage {
+    #[serde(rename = "Cols")]
+    cols: u16,
+    #[serde(rename = "Rows")]
+    rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeadlessMessage {
+    #[serde(rename = "Headless")]
+    headless: bool,
 }
 
 // Structure for window size (from sys/ioctl.h)
@@ -162,12 +183,20 @@ async fn run_client(session_url: String) -> Result<()> {
     // Set up global terminal restoration for all exit scenarios
     setup_global_terminal_restoration(original_termios)?;
 
+    // Set up SIGWINCH handler for terminal size changes
+    unsafe {
+        libc::signal(libc::SIGWINCH, sigwinch_handler as usize);
+    }
+
     // Get initial terminal size
     let (initial_cols, initial_rows) = get_terminal_size().unwrap_or((80, 24));
     debug!("Initial terminal size: {}x{}", initial_cols, initial_rows);
 
     // Create an atomic flag for graceful shutdown
     let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Track server headless state
+    let server_headless = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Parse the session URL and convert to WebSocket URL
     let url = Url::parse(&session_url)?;
@@ -194,11 +223,20 @@ async fn run_client(session_url: String) -> Result<()> {
     let (ws_stream, _) = connect_async(&ws_url).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    let shutdown_flag_for_stdin = shutdown_flag.clone();
+    // Create channels for communication between tasks
+    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (size_tx, mut size_rx) = mpsc::unbounded_channel::<(u16, u16)>();
 
-    // Set up stdin forwarding using blocking I/O to capture each keystroke
+    let shutdown_flag_for_stdin = shutdown_flag.clone();
+    let shutdown_flag_for_winsize = shutdown_flag.clone();
+    let shutdown_flag_for_sender = shutdown_flag.clone();
+    let shutdown_flag_for_stdout = shutdown_flag.clone();
+    let server_headless_for_winsize = server_headless.clone();
+    let server_headless_for_stdout = server_headless.clone();
+
+    // Task for reading stdin and sending to stdin channel
     let stdin_task = tokio::task::spawn_blocking(move || {
-        use std::io::{stdin, Read};
+        use std::io::{Read, stdin};
         let mut stdin = stdin();
         let mut buffer = [0u8; 1]; // Read one byte at a time for immediate response
 
@@ -213,26 +251,12 @@ async fn run_client(session_url: String) -> Result<()> {
                     // Check for Ctrl+C (ASCII 3) to exit client
                     if buffer[0] == 3 {
                         debug!("Ctrl+C detected, exiting client");
-                        // Set shutdown flag and break from loop
                         shutdown_flag_for_stdin.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
 
-                    let data = general_purpose::STANDARD.encode(&buffer[..n]);
-                    let write_msg = WriteMessage { size: n, data };
-
-                    let message = TtyMessage {
-                        msg_type: "Write".to_string(),
-                        data: general_purpose::STANDARD
-                            .encode(serde_json::to_vec(&write_msg).unwrap()),
-                    };
-
-                    let json_str = serde_json::to_string(&message).unwrap();
-
-                    // Send message synchronously using tokio runtime handle
-                    let rt = tokio::runtime::Handle::current();
-                    if let Err(e) = rt.block_on(ws_sender.send(Message::Text(json_str))) {
-                        error!("Failed to send message: {}", e);
+                    // Send data through channel
+                    if stdin_tx.send(buffer[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -246,14 +270,124 @@ async fn run_client(session_url: String) -> Result<()> {
                 }
             }
         }
-        debug!("Stdin forwarding task ended");
+        debug!("Stdin reading task ended");
     });
 
-    let shutdown_flag_for_stdout = shutdown_flag.clone();
+    // Task for monitoring window size changes
+    let winsize_task = tokio::spawn(async move {
+        let mut last_size = (initial_cols, initial_rows);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(200));
 
-    // Set up stdout output using blocking I/O for immediate display
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Check shutdown flag
+                    if shutdown_flag_for_winsize.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Check if window size changed
+                    if WINDOW_SIZE_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        if let Ok(current_size) = get_terminal_size() {
+                            if current_size != last_size {
+                                debug!("Client terminal size changed: {}x{} -> {}x{}",
+                                       last_size.0, last_size.1, current_size.0, current_size.1);
+
+                                // Only send size change to server if server is in headless mode
+                                if server_headless_for_winsize.load(std::sync::atomic::Ordering::Relaxed) {
+                                    debug!("Server is in headless mode, sending size change to server");
+                                    // Send size change through channel
+                                    if size_tx.send(current_size).is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    debug!("Server is not in headless mode, not sending size change to server");
+                                }
+
+                                last_size = current_size;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        debug!("Window size monitoring task ended");
+    });
+
+    // Task for sending messages to WebSocket (combines stdin and window size messages)
+    let sender_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // Handle stdin messages
+                stdin_data = stdin_rx.recv() => {
+                    match stdin_data {
+                        Some(data) => {
+                            let encoded_data = general_purpose::STANDARD.encode(&data);
+                            let write_msg = WriteMessage {
+                                size: data.len(),
+                                data: encoded_data
+                            };
+
+                            let message = TtyMessage {
+                                msg_type: "Write".to_string(),
+                                data: general_purpose::STANDARD
+                                    .encode(serde_json::to_vec(&write_msg).unwrap()),
+                            };
+
+                            let json_str = serde_json::to_string(&message).unwrap();
+
+                            if let Err(e) = ws_sender.send(Message::Text(json_str)).await {
+                                error!("Failed to send stdin message: {}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            debug!("Stdin channel closed");
+                            break;
+                        }
+                    }
+                }
+
+                // Handle window size change messages
+                size_data = size_rx.recv() => {
+                    match size_data {
+                        Some((cols, rows)) => {
+                            let winsize_msg = WinSizeMessage { cols, rows };
+
+                            let message = TtyMessage {
+                                msg_type: "WinSize".to_string(),
+                                data: general_purpose::STANDARD
+                                    .encode(serde_json::to_vec(&winsize_msg).unwrap()),
+                            };
+
+                            let json_str = serde_json::to_string(&message).unwrap();
+
+                            if let Err(e) = ws_sender.send(Message::Text(json_str)).await {
+                                error!("Failed to send window size message: {}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            debug!("Window size channel closed");
+                            break;
+                        }
+                    }
+                }
+
+                // Check shutdown flag periodically
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    if shutdown_flag_for_sender.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+        }
+        debug!("WebSocket sender task ended");
+    });
+
+    // Task for receiving messages from WebSocket and writing to stdout
     let stdout_task = tokio::spawn(async move {
-        use std::io::{stdout, Write};
+        use std::io::{Write, stdout};
         let mut stdout = stdout();
 
         while let Some(msg) = ws_receiver.next().await {
@@ -267,11 +401,8 @@ async fn run_client(session_url: String) -> Result<()> {
                     if let Ok(tty_msg) = serde_json::from_str::<TtyMessage>(&text) {
                         if tty_msg.msg_type == "Write" {
                             if let Ok(data) = general_purpose::STANDARD.decode(&tty_msg.data) {
-                                if let Ok(write_msg) = serde_json::from_slice::<WriteMessage>(&data)
-                                {
-                                    if let Ok(output) =
-                                        general_purpose::STANDARD.decode(&write_msg.data)
-                                    {
+                                if let Ok(write_msg) = serde_json::from_slice::<WriteMessage>(&data) {
+                                    if let Ok(output) = general_purpose::STANDARD.decode(&write_msg.data) {
                                         // Write directly to stdout without buffering for immediate display
                                         if let Err(e) = stdout.write_all(&output) {
                                             error!("Failed to write to stdout: {}", e);
@@ -284,22 +415,28 @@ async fn run_client(session_url: String) -> Result<()> {
                                 }
                             }
                         } else if tty_msg.msg_type == "WinSize" {
-                            // Handle window size changes
+                            // Handle window size changes from server
                             if let Ok(data) = general_purpose::STANDARD.decode(&tty_msg.data) {
-                                if let Ok(winsize_msg) =
-                                    serde_json::from_slice::<serde_json::Value>(&data)
-                                {
+                                if let Ok(winsize_msg) = serde_json::from_slice::<serde_json::Value>(&data) {
                                     if let (Some(cols), Some(rows)) = (
                                         winsize_msg.get("Cols").and_then(|v| v.as_u64()),
                                         winsize_msg.get("Rows").and_then(|v| v.as_u64()),
                                     ) {
-                                        debug!("Received window size change: {}x{}", cols, rows);
+                                        debug!("Received window size change from server: {}x{}", cols, rows);
                                         // Set the actual terminal size
-                                        if let Err(e) = set_terminal_size(cols as u16, rows as u16)
-                                        {
+                                        if let Err(e) = set_terminal_size(cols as u16, rows as u16) {
                                             error!("Failed to set terminal size: {}", e);
                                         }
                                     }
+                                }
+                            }
+                        } else if tty_msg.msg_type == "Headless" {
+                            // Handle headless state from server
+                            if let Ok(data) = general_purpose::STANDARD.decode(&tty_msg.data) {
+                                if let Ok(headless_msg) = serde_json::from_slice::<HeadlessMessage>(&data) {
+                                    debug!("Received headless state from server: {}", headless_msg.headless);
+                                    server_headless_for_stdout
+                                        .store(headless_msg.headless, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
                         }
@@ -321,15 +458,24 @@ async fn run_client(session_url: String) -> Result<()> {
         debug!("Stdout forwarding task ended");
     });
 
-    // Wait for either task to complete or shutdown flag
+    // Wait for any task to complete or shutdown flag
     tokio::select! {
         _ = stdin_task => {
             debug!("Stdin task completed");
+        },
+        _ = winsize_task => {
+            debug!("Window size task completed");
+        },
+        _ = sender_task => {
+            debug!("Sender task completed");
         },
         _ = stdout_task => {
             debug!("Stdout task completed");
         },
     }
+
+    // Set shutdown flag to stop other tasks
+    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Restore terminal before exiting
     restore_terminal(&original_termios);
@@ -370,19 +516,14 @@ fn setup_raw_terminal() -> Result<Termios> {
     termios::cfmakeraw(&mut raw_termios);
 
     // Explicitly disable echo and canonical mode (equivalent to stty -echo -icanon)
-    raw_termios.c_lflag &=
-        !(termios::ECHO | termios::ECHOE | termios::ECHOK | termios::ECHONL | termios::ICANON);
+    raw_termios.c_lflag &= !(termios::ECHO | termios::ECHOE | termios::ECHOK | termios::ECHONL | termios::ICANON);
 
     // Disable signal generation
     raw_termios.c_lflag &= !termios::ISIG;
 
     // Disable input processing
-    raw_termios.c_iflag &= !(termios::ICRNL
-        | termios::INLCR
-        | termios::IGNCR
-        | termios::IXON
-        | termios::IXOFF
-        | termios::ISTRIP);
+    raw_termios.c_iflag &=
+        !(termios::ICRNL | termios::INLCR | termios::IGNCR | termios::IXON | termios::IXOFF | termios::ISTRIP);
 
     // Disable output processing for input terminal
     raw_termios.c_oflag &= !termios::OPOST;

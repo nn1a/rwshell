@@ -2,10 +2,10 @@ use crate::error::Result;
 use crate::pty::PtyHandler;
 use crate::websocket::{TtyMessage, TtyWebSocket};
 use axum::extract::ws::WebSocket;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -68,9 +68,8 @@ impl TtyShareSession {
         // Set up input handling
         let session_output_tx = self.output_tx.clone();
         let tty_ws_input = Arc::clone(&tty_ws);
-        let input_task = tokio::spawn(async move {
-            Self::handle_connection_messages(tty_ws_input, pty, session_output_tx).await
-        });
+        let input_task =
+            tokio::spawn(async move { Self::handle_connection_messages(tty_ws_input, pty, session_output_tx).await });
 
         info!("New WebSocket connection added to session {}", self.id);
 
@@ -99,14 +98,9 @@ impl TtyShareSession {
                     debug!("Received message: {:?}", msg);
                     match msg.msg_type.as_str() {
                         "Write" => {
-                            if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&msg.data)
-                            {
-                                if let Ok(write_msg) =
-                                    serde_json::from_slice::<WriteMessage>(&write_msg_data)
-                                {
-                                    if let Ok(decoded_data) =
-                                        general_purpose::STANDARD.decode(&write_msg.data)
-                                    {
+                            if let Ok(write_msg_data) = general_purpose::STANDARD.decode(&msg.data) {
+                                if let Ok(write_msg) = serde_json::from_slice::<WriteMessage>(&write_msg_data) {
+                                    if let Ok(decoded_data) = general_purpose::STANDARD.decode(&write_msg.data) {
                                         let mut pty_guard = pty.lock().await;
                                         if let Err(e) = pty_guard.write(&decoded_data).await {
                                             error!("Failed to write to PTY: {}", e);
